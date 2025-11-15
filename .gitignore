@@ -1,2 +1,5 @@
 venv/
 .env
+output_png_images/
+pdfs/
+output_png_images.zip
