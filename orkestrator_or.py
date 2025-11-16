@@ -7,11 +7,10 @@ import numpy as np
 from pdf2image import convert_from_path
 from pathlib import Path
 from stamps_and_signs_detector import detect_signatures_and_stamps_dual
-from qr_detector import add_qr_code_detections_ultimate
+from qr_detector_or import add_qr_code_detections_turbo
 
 
-# --- КОНФИГУРАЦИЯ ---
-INPUT_PDF_DIRECTORY = "pdfs"
+INPUT_PDF_DIRECTORY = "test"
 OUTPUT_DIRECTORY = "processed_results"
 POPPLER_PATH = r"C:\Users\user\Downloads\Release-25.11.0-0\poppler-25.11.0\Library\bin"
 
@@ -60,10 +59,8 @@ def process_single_pdf(
             )
             continue
 
-        final_image, final_page_data, annotation_counter = (
-            add_qr_code_detections_ultimate(
-                img_after_model1, page_data_after_model1, annotation_counter
-            )
+        final_image, final_page_data, annotation_counter = add_qr_code_detections_turbo(
+            img_after_model1, page_data_after_model1, annotation_counter
         )
 
         pdf_annotations[f"page_{page_num}"] = final_page_data

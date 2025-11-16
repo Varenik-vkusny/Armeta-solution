@@ -8,7 +8,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List
 from contextlib import asynccontextmanager
-from orkestrator import process_directory
+from orkestrator_or import process_directory
 from starlette.concurrency import run_in_threadpool
 
 logging.basicConfig(level=logging.INFO)
