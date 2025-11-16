@@ -3,10 +3,13 @@ import shutil
 import tempfile
 import logging
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
 from typing import List
 from contextlib import asynccontextmanager
-from .orkestrator import process_directory
+from orkestrator import process_directory
+from starlette.concurrency import run_in_threadpool
 
 logging.basicConfig(level=logging.INFO)
 
@@ -32,6 +35,26 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Разрешаем все источники
+    allow_credentials=True,
+    allow_methods=["*"],  # Разрешаем все методы (GET, POST и т.д.)
+    allow_headers=["*"],  # Разрешаем все заголовки
+)
+
+# --- ДОБАВЛЕНО: МОНТИРОВАНИЕ СТАТИЧЕСКИХ ФАЙЛОВ ---
+# FastAPI будет автоматически отдавать файлы из папки 'static' по пути '/static'
+# Например, ваш файл 'static/images/v5_46.png' будет доступен по URL '/static/images/v5_46.png'
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+@app.get("/", response_class=HTMLResponse)
+async def read_root():
+    # Читаем ваш HTML-файл и возвращаем его как ответ
+    with open("templates/index.html", "r", encoding="utf-8") as f:
+        return HTMLResponse(content=f.read(), status_code=200)
 
 
 @app.post(
@@ -67,15 +90,14 @@ async def process_batch_zip_endpoint(
                 while content := await file.read(1024 * 1024):  # Читаем по 1МБ
                     buffer.write(content)
 
-        # 3. Запуск твоей существующей батч-логики
-        process_directory(input_temp_dir, output_temp_dir)
+        await run_in_threadpool(process_directory, input_temp_dir, output_temp_dir)
 
-        # 4. Создание ZIP-архива из OUTPUT-папки
-        # shutil.make_archive создает ZIP-архив из содержимого output_temp_dir
-        shutil.make_archive(
-            base_name=os.path.splitext(zip_path)[0],  # Путь без расширения
+        # ===== ИЗМЕНЕНИЕ №3: СОЗДАНИЕ АРХИВА ТОЖЕ ЗАПУСКАЕМ В ПОТОКЕ =====
+        await run_in_threadpool(
+            shutil.make_archive,
+            base_name=os.path.splitext(zip_path)[0],
             format="zip",
-            root_dir=output_temp_dir,  # Корневая папка для архивации
+            root_dir=output_temp_dir,
         )
 
     except Exception as e:

@@ -11,7 +11,7 @@ from qr_detector import add_qr_code_detections_ultimate
 
 
 # --- КОНФИГУРАЦИЯ ---
-INPUT_PDF_DIRECTORY = "test"
+INPUT_PDF_DIRECTORY = "pdfs"
 OUTPUT_DIRECTORY = "processed_results"
 POPPLER_PATH = r"C:\Users\user\Downloads\Release-25.11.0-0\poppler-25.11.0\Library\bin"
 
