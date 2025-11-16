@@ -5,19 +5,14 @@ import cv2
 import glob
 import numpy as np
 from pdf2image import convert_from_path
-from pathlib import Path  # Используем pathlib для более удобной работы с путями
+from pathlib import Path
+from main_detector_mock import detect_signatures_and_stamps_dual
+from fast_qr import add_qr_code_detections_ultimate
 
-# --- ВАЖНО: Внесите изменения в эти файлы! ---
-# Мы изменили то, КАК эти функции вызываются.
-# Раньше было: detect(filename, ...), теперь: detect(image_data, ...)
-from main_detector_mock import detect_signatures_and_stamps_mock
-from qr_detector import add_qr_code_detections
 
 # --- КОНФИГУРАЦИЯ ---
-# Поместите все настраиваемые переменные в одно место
 INPUT_PDF_DIRECTORY = "test"
 OUTPUT_DIRECTORY = "processed_results"
-# Укажите ваш путь к Poppler здесь. Оставьте None, если он добавлен в системный PATH.
 POPPLER_PATH = r"C:\Users\user\Downloads\Release-25.11.0-0\poppler-25.11.0\Library\bin"
 
 
@@ -31,22 +26,15 @@ def process_single_pdf(
     pdf_filename = pdf_path.name
     print(f"====== Начинаю обработку файла: {pdf_filename} ======")
 
-    # --- ИЗМЕНЕНИЕ ЗДЕСЬ ---
-    # "Очищаем" имя файла от проблемных символов в конце (пробелы, точки, дефисы)
-    # перед тем, как создавать из него имя папки.
     sanitized_stem = pdf_path.stem.strip().rstrip("-. ")
 
-    # На случай, если имя файла было, например, "-.pdf", и после очистки ничего не осталось
     if not sanitized_stem:
         sanitized_stem = f"unnamed_pdf_{pdf_path.name}"
 
-    # Создаем подпапку для результатов этого PDF, используя очищенное имя
     pdf_specific_output_dir = output_dir / sanitized_stem
     pdf_specific_output_dir.mkdir(parents=True, exist_ok=True)
-    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
     try:
-        # Конвертируем PDF в список изображений формата PIL
         images = convert_from_path(str(pdf_path), dpi=300, poppler_path=POPPLER_PATH)
     except Exception as e:
         print(f"[ОШИБКА] Не удалось конвертировать PDF '{pdf_filename}': {e}")
@@ -59,13 +47,11 @@ def process_single_pdf(
         page_num = i + 1
         print(f"\n--- Обработка страницы {page_num} ---")
 
-        # ... (код конвертации и вызова моделей остается без изменений) ...
-
         image_np_rgb = np.array(pil_image)
         image_np_bgr = cv2.cvtColor(image_np_rgb, cv2.COLOR_RGB2BGR)
 
         img_after_model1, page_data_after_model1, annotation_counter = (
-            detect_signatures_and_stamps_mock(image_np_bgr, annotation_counter)
+            detect_signatures_and_stamps_dual(image_np_bgr, annotation_counter)
         )
 
         if img_after_model1 is None:
@@ -74,25 +60,22 @@ def process_single_pdf(
             )
             continue
 
-        final_image, final_page_data, annotation_counter = add_qr_code_detections(
-            img_after_model1, page_data_after_model1, annotation_counter
+        final_image, final_page_data, annotation_counter = (
+            add_qr_code_detections_ultimate(
+                img_after_model1, page_data_after_model1, annotation_counter
+            )
         )
 
         pdf_annotations[f"page_{page_num}"] = final_page_data
 
-        # Сохраняем только конечное обработанное изображение
         output_image_path = pdf_specific_output_dir / f"page_{page_num}_processed.png"
 
-        # --- ЗАМЕНИТЕ ЭТОТ БЛОК ---
         try:
-            # ИСПОЛЬЗУЕМ НАДЕЖНЫЙ СПОСОБ СОХРАНЕНИЯ ДЛЯ WINDOWS С КИРИЛЛИЦЕЙ
 
-            # 1. Кодируем изображение в формат PNG в памяти (в виде массива байтов)
             is_success, im_buf_arr = cv2.imencode(".png", final_image)
 
             if is_success:
-                # 2. Записываем этот массив байтов в файл.
-                #    Этот метод корректно работает с Unicode-путями.
+
                 with open(output_image_path, "wb") as f:
                     f.write(im_buf_arr.tobytes())
                 print(
@@ -107,9 +90,7 @@ def process_single_pdf(
             print(
                 f"[КРИТИЧЕСКАЯ ОШИБКА] Не удалось сохранить файл {output_image_path}. Ошибка: {e}"
             )
-        # --- КОНЕЦ ЗАМЕНЯЕМОГО БЛОКА ---
 
-    # Возвращаем словарь только для этого PDF
     return {pdf_filename: pdf_annotations}, annotation_counter
 
 
@@ -132,7 +113,7 @@ def process_directory(input_dir: str, output_dir: str):
     )
 
     all_results = {}
-    annotation_counter = 1  # Глобальный счетчик аннотаций
+    annotation_counter = 1
 
     for pdf_path in pdf_files:
         result_for_one_pdf, annotation_counter = process_single_pdf(
@@ -141,11 +122,9 @@ def process_directory(input_dir: str, output_dir: str):
         if result_for_one_pdf:
             all_results.update(result_for_one_pdf)
 
-    # --- ГЛАВНОЕ ИЗМЕНЕНИЕ ДЛЯ ОТЛАДКИ ---
     if all_results:
         output_json_path = output_path / "annotations.json"
 
-        # Оборачиваем сохранение в try...except, чтобы поймать точную ошибку
         try:
             print("\n====== Пытаюсь сохранить итоговый JSON... ======")
             with open(output_json_path, "w", encoding="utf-8") as f:
@@ -156,7 +135,7 @@ def process_directory(input_dir: str, output_dir: str):
             )
 
         except TypeError as e:
-            # Если ошибка именно в типе данных, выводим подробное сообщение
+
             print("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
             print("!!!!!! КРИТИЧЕСКАЯ ОШИБКА: Не удалось сохранить JSON !!!!!!")
             print(f"!!!!!! Точная ошибка: {e}")
@@ -168,7 +147,6 @@ def process_directory(input_dir: str, output_dir: str):
             )
             print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
 
-            # Сохраняем "сырые" данные в текстовый файл, чтобы посмотреть на них
             debug_file_path = output_path / "debug_data_dump.txt"
             with open(debug_file_path, "w", encoding="utf-8") as f:
                 f.write(str(all_results))
@@ -183,7 +161,6 @@ def process_directory(input_dir: str, output_dir: str):
 
 
 if __name__ == "__main__":
-    # Создаем папку для PDF, если ее нет
     Path(INPUT_PDF_DIRECTORY).mkdir(exist_ok=True)
     print(f"Проверьте, что ваши PDF файлы находятся в папке: '{INPUT_PDF_DIRECTORY}'")
     print(f"Результаты будут сохранены в папку: '{OUTPUT_DIRECTORY}'")
