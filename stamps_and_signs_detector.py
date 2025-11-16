@@ -81,8 +81,6 @@ def detect_with_model_1(image_data, existing_page_data, annotation_start_index: 
                 "category": label,
                 "bbox": {"x": bbox_x, "y": bbox_y, "width": width, "height": height},
                 "area": width * height,
-                "confidence": float(box.conf[0]),
-                "model_source": "model_1_primary",
             }
         }
         existing_page_data["annotations"].append(annotation)

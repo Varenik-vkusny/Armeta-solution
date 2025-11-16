@@ -267,7 +267,7 @@ def add_qr_code_detections_turbo(
                                             "source": f"yolo_confirmed_by_{source}",
                                         }
                                     )
-                                    print(f"    ✓ YOLO нашел новый QR!")
+                                    print("    ✓ YOLO нашел новый QR!")
                                     break  # Early stop после первой находки в этом crop
 
         except Exception as e:
@@ -279,15 +279,8 @@ def add_qr_code_detections_turbo(
     if found_qrs:
         print(f"--- ✓ Найдено {len(found_qrs)} уникальных QR-кодов")
         for item in found_qrs:
-            decoded_data_bytes = item["data"]
             points = item["points"]
             source = item["source"]
-
-            decoded_data = "decoding_failed"
-            try:
-                decoded_data = decoded_data_bytes.decode("utf-8")
-            except Exception:
-                decoded_data = "decoding_error"
 
             x, y, w, h = cv2.boundingRect(points.astype(int))
 
@@ -296,9 +289,6 @@ def add_qr_code_detections_turbo(
                     "category": "qr_code",
                     "bbox": {"x": x, "y": y, "width": w, "height": h},
                     "area": w * h,
-                    "decoded_data": decoded_data,
-                    "confidence": 1.0,
-                    "source_method": source,
                 }
             }
             existing_page_data["annotations"].append(annotation)
