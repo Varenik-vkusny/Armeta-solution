@@ -1,321 +1,229 @@
 import cv2
-import ultralytics
-from pyzbar.pyzbar import decode
 import numpy as np
+from pyzbar import pyzbar
+from concurrent.futures import ProcessPoolExecutor, TimeoutError
 from ultralytics import YOLO
-from concurrent.futures import ThreadPoolExecutor
 import time
 
-# --- ЗАГРУЗКА МОДЕЛИ YOLO ---
-MODEL_PATH = "best.pt"
-try:
-    yolo_model = YOLO(MODEL_PATH)
-    print(f"--- Модель YOLO ('{MODEL_PATH}') успешно загружена. ---")
-except Exception as e:
-    print(
-        f"--- [ПРЕДУПРЕЖДЕНИЕ] Не удалось загрузить модель YOLO '{MODEL_PATH}'. Ошибка: {e} ---"
-    )
-    yolo_model = None
+# --- Вспомогательные функции ---
 
-
-def _run_pyzbar_fast(image_to_scan, methods=["grayscale", "adaptive_thresh"]):
+def _calculate_iou(boxA, boxB):
     """
-    [УЛЬТРА-БЫСТРАЯ ВЕРСИЯ]
-    Запускает только самые эффективные методы Pyzbar.
-    По умолчанию: grayscale + adaptive_thresh (они находят 90%+ всех QR)
+    Рассчитывает Intersection over Union (IoU) для двух ограничивающих рамок.
+    Формат рамок: [xA, yA, xB, yB]
     """
-    found_objects = []
-    gray = cv2.cvtColor(image_to_scan, cv2.COLOR_BGR2GRAY)
+    # Определяем координаты пересекающегося прямоугольника
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2])
+    yB = min(boxA[3], boxB[3])
 
-    # Словарь всех возможных методов
-    all_methods = {
-        "grayscale": gray,
-        "adaptive_thresh": None,  # Создадим по требованию
-        "otsu_thresh": None,
-        "original_bgr": image_to_scan,
-    }
+    # Вычисляем площадь пересечения
+    interArea = max(0, xB - xA + 1) * max(0, yB - yA + 1)
 
-    for method_name in methods:
-        if method_name not in all_methods:
-            continue
+    # Вычисляем площади обеих рамок
+    boxAArea = (boxA[2] - boxA[0] + 1) * (boxA[3] - boxA[1] + 1)
+    boxBArea = (boxB[2] - boxB[0] + 1) * (boxB[3] - boxB[1] + 1)
 
-        # Ленивое создание предобработанных изображений
-        if method_name == "adaptive_thresh" and all_methods[method_name] is None:
-            blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-            all_methods[method_name] = cv2.adaptiveThreshold(
-                blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 7
-            )
-        elif method_name == "otsu_thresh" and all_methods[method_name] is None:
-            blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-            all_methods[method_name] = cv2.threshold(
-                blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-            )[1]
+    # Вычисляем IoU
+    iou = interArea / float(boxAArea + boxBArea - interArea)
+    return iou
 
-        image_for_decode = all_methods[method_name]
-
-        try:
-            qrcodes = decode(image_for_decode)
-            for qr in qrcodes:
-                found_objects.append({"qr_obj": qr, "source": f"pyzbar_{method_name}"})
-        except Exception as e:
-            pass  # Тихо игнорируем ошибки для скорости
-
-    return found_objects
-
-
-def _process_scale(scale, input_image, orig_w, orig_h):
+def is_duplicate(new_item_points, existing_items, iou_threshold=0.8):
     """
-    Обработка одного масштаба (для параллелизации)
+    Проверяет, является ли найденный объект дубликатом уже существующего.
+    Сравнивает IoU новой рамки со всеми уже найденными.
     """
-    if scale == 1.0:
-        scaled_image = input_image
-    else:
-        try:
-            interpolation_method = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
-            scaled_image = cv2.resize(
-                input_image,
-                (int(orig_w * scale), int(orig_h * scale)),
-                interpolation=interpolation_method,
-            )
-        except Exception:
-            return []
-
-    if scaled_image is None or scaled_image.size == 0:
-        return []
-
-    # Используем только 2 самых эффективных метода
-    found_objects = _run_pyzbar_fast(
-        scaled_image, methods=["grayscale", "adaptive_thresh"]
-    )
-
-    # Нормализуем координаты обратно к оригинальному размеру
-    results = []
-    for item in found_objects:
-        qr_obj = item["qr_obj"]
-        source = item["source"]
-        data_bytes = qr_obj.data
-        points_scaled = np.array(qr_obj.polygon, dtype=np.float32)
-
-        if data_bytes is not None:
-            points_original = points_scaled / scale
-            results.append(
-                {
-                    "data": data_bytes,
-                    "points": points_original,
-                    "source": f"{source}_scale_{scale}x",
-                }
-            )
-
-    return results
-
-
-def is_duplicate(new_points, existing_qrs, threshold=0.7):
-    """
-    [ОПТИМИЗИРОВАНО] Порог снижен до 0.7 для более строгой проверки
-    """
-    new_box = cv2.boundingRect(new_points.astype(int))
-    nx, ny, nw, nh = new_box
-
-    for qr in existing_qrs:
-        existing_box = cv2.boundingRect(qr["points"].astype(int))
-        ex, ey, ew, eh = existing_box
-
-        # Быстрая проверка: если bbox'ы вообще не пересекаются
-        if nx + nw < ex or ex + ew < nx or ny + nh < ey or ey + eh < ny:
-            continue
-
-        # Вычисляем IoU
-        ix = max(nx, ex)
-        iy = max(ny, ey)
-        iw = min(nx + nw, ex + ew) - ix
-        ih = min(ny + nh, ey + eh) - iy
-
-        if iw > 0 and ih > 0:
-            intersection_area = iw * ih
-            union_area = (nw * nh) + (ew * eh) - intersection_area
-            iou = intersection_area / union_area
-
-            if iou > threshold:
-                return True
-
+    for existing_item in existing_items:
+        if _calculate_iou(new_item_points, existing_item["points"]) > iou_threshold:
+            return True
     return False
 
+# --- Функции для параллельной обработки ---
 
-def add_qr_code_detections_turbo(
-    input_image_np,
-    existing_page_data,
-    annotation_start_index: int,
-    use_parallel=True,
-    early_stop=True,
-):
+def _process_scale_wrapper(args):
     """
-    🚀 ТУРБО-ВЕРСИЯ: Максимально оптимизированный детектор
-
-    Параметры:
-    - use_parallel: использовать параллельную обработку масштабов (быстрее на мощных CPU)
-    - early_stop: останавливаться после нахождения QR-кодов (экономит время)
+    Обертка для функции обработки изображения в другом масштабе.
+    Принимает кортеж аргументов, чтобы быть совместимой с ProcessPoolExecutor.map().
+    Эта функция будет выполняться в отдельном процессе.
     """
-    start_time = time.time()
-    print("--- 🚀 ТУРБО-ДЕТЕКТОР: Запуск оптимизированного поиска QR-кодов...")
+    scale, image_bytes, original_shape = args
+    
+    # 1. Восстанавливаем numpy-массив изображения из байтов
+    input_image_np = np.frombuffer(image_bytes, dtype=np.uint8).reshape(original_shape)
+    orig_h, orig_w = original_shape[:2]
 
+    # 2. Изменяем масштаб изображения
+    # Используем INTER_AREA для уменьшения - это качественнее
+    interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+    new_w, new_h = int(orig_w * scale), int(orig_h * scale)
+    scaled_img = cv2.resize(input_image_np, (new_w, new_h), interpolation=interpolation)
+
+    # 3. Детектируем QR-коды с помощью pyzbar
+    barcodes = pyzbar.decode(scaled_img)
+    
+    found_items = []
+    for barcode in barcodes:
+        if barcode.type == 'QRCODE':
+            x, y, w, h = barcode.rect
+            
+            # 4. Масштабируем координаты обратно к оригинальному размеру
+            orig_x = int(x / scale)
+            orig_y = int(y / scale)
+            orig_w = int(w / scale)
+            orig_h = int(h / scale)
+            
+            item = {
+                "points": [orig_x, orig_y, orig_x + orig_w, orig_y + orig_h],
+                "value": barcode.data.decode('utf-8', errors='ignore')
+            }
+            found_items.append(item)
+            
+    return found_items
+
+# --- Основная функция детектора ---
+
+def find_qrs(input_image_np: np.ndarray, use_parallel: bool = True, use_yolo_fallback: bool = True):
+    """
+    Основная функция для поиска QR-кодов на изображении с использованием нескольких стратегий.
+
+    Args:
+        input_image_np (np.ndarray): Изображение в формате OpenCV (Numpy array).
+        use_parallel (bool): Использовать ли параллельную обработку для мультимасштабного поиска.
+        use_yolo_fallback (bool): Использовать ли YOLO как резервный метод.
+
+    Returns:
+        list: Список словарей с информацией о найденных QR-кодах.
+    """
     found_qrs = []
-    image_with_boxes = input_image_np.copy()
-    current_annotation_index = annotation_start_index
-    orig_h, orig_w, _ = input_image_np.shape
+    orig_h, orig_w = input_image_np.shape[:2]
+    
+    # ==============================================================================
+    # СТРАТЕГИЯ 1: Базовый поиск на исходном изображении
+    # ==============================================================================
+    print("--- [Стратегия 1] Поиск на исходном изображении...")
+    start_time = time.time()
+    
+    # Для pyzbar лучше работать с оттенками серого
+    gray_image = cv2.cvtColor(input_image_np, cv2.COLOR_BGR2GRAY) if len(input_image_np.shape) > 2 else input_image_np
+
+    base_results = pyzbar.decode(gray_image)
+    for barcode in base_results:
+        if barcode.type == 'QRCODE':
+            x, y, w, h = barcode.rect
+            item = {
+                "points": [x, y, x + w, y + h],
+                "value": barcode.data.decode('utf-8', errors='ignore')
+            }
+            if not is_duplicate(item["points"], found_qrs):
+                found_qrs.append(item)
+    
+    print(f"    Найдено: {len(found_qrs)} QR-кодов. (Заняло: {time.time() - start_time:.2f} с)")
 
     # ==============================================================================
-    # СТРАТЕГИЯ 1: Начинаем с нативного разрешения (scale=1.0)
+    # СТРАТЕГИЯ 2: Мультимасштабный поиск (оптимизированный с ProcessPoolExecutor)
     # ==============================================================================
-    print("--- [Стратегия 1] Быстрая проверка на нативном разрешении...")
+    print("--- [Стратегия 2] Мультимасштабный поиск...")
+    start_time = time.time()
+    
+    additional_scales = [0.5, 2.0]  # Уменьшение и увеличение
 
-    native_results = _process_scale(1.0, input_image_np, orig_w, orig_h)
-    for item in native_results:
-        if not is_duplicate(item["points"], found_qrs):
-            found_qrs.append(item)
+    # Сериализуем изображение для безопасной передачи между процессами
+    image_bytes_to_send = gray_image.tobytes()
+    shape_to_send = gray_image.shape
+    
+    process_args = [(scale, image_bytes_to_send, shape_to_send) for scale in additional_scales]
 
-    print(f"    Найдено: {len(found_qrs)} QR-кодов")
-
-    # Early stop: если нашли достаточно QR-кодов на нативном разрешении
-    if early_stop and len(found_qrs) > 0:
-        print("    ✓ QR-коды найдены! Пропускаем дополнительные масштабы.")
+    if use_parallel:
+        try:
+            # ИСПОЛЬЗУЕМ ПРОЦЕССЫ ДЛЯ РЕАЛЬНОГО ПАРАЛЛЕЛИЗМА CPU-BOUND ЗАДАЧ
+            with ProcessPoolExecutor(max_workers=len(additional_scales)) as executor:
+                # map более эффективен для однотипных задач
+                all_results = executor.map(_process_scale_wrapper, process_args, timeout=20.0)
+                
+                for results_from_scale in all_results:
+                    for item in results_from_scale:
+                        if not is_duplicate(item["points"], found_qrs):
+                            found_qrs.append(item)
+        except TimeoutError:
+            print("    ⚠ Таймаут при параллельной обработке! Некоторые задачи могли не завершиться.")
+        except Exception as e:
+            print(f"    ⚠ Ошибка в параллельной обработке: {e}")
     else:
-        # ==============================================================================
-        # СТРАТЕГИЯ 2: Мультимасштабный поиск (параллельный или последовательный)
-        # ==============================================================================
-        print("--- [Стратегия 2] Мультимасштабный поиск...")
+        # Последовательная обработка для отладки
+        for args in process_args:
+            results = _process_scale_wrapper(args)
+            for item in results:
+                if not is_duplicate(item["points"], found_qrs):
+                    found_qrs.append(item)
 
-        # Оптимизированный набор масштабов: только критические
-        additional_scales = [0.5, 2.0]  # Уменьшили с [0.5, 2.0] (было 3 scale)
+    print(f"    Всего найдено после мультимасштабного поиска: {len(found_qrs)}. (Заняло: {time.time() - start_time:.2f} с)")
 
-        if use_parallel:
-            # Параллельная обработка масштабов
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                futures = [
-                    executor.submit(
-                        _process_scale, scale, input_image_np, orig_w, orig_h
-                    )
-                    for scale in additional_scales
-                ]
-
-                for future in futures:
-                    try:
-                        results = future.result(timeout=5.0)  # Таймаут для защиты
-                        for item in results:
-                            if not is_duplicate(item["points"], found_qrs):
-                                found_qrs.append(item)
-                    except Exception as e:
-                        print(f"    ⚠ Ошибка в параллельной обработке: {e}")
-        else:
-            # Последовательная обработка
-            for scale in additional_scales:
-                results = _process_scale(scale, input_image_np, orig_w, orig_h)
-                for item in results:
+    # ==============================================================================
+    # СТРАТЕГИЯ 3: Резервный поиск с помощью YOLO (если ничего не найдено)
+    # ==============================================================================
+    if not found_qrs and use_yolo_fallback:
+        print("--- [Стратегия 3] Ничего не найдено, запускаем резервный поиск (YOLO)...")
+        start_time = time.time()
+        try:
+            model = YOLO('best.pt')  # Убедитесь, что модель лежит в корне проекта
+            results = model(input_image_np, verbose=False)
+            
+            for result in results:
+                boxes = result.boxes.cpu().numpy()
+                for box in boxes:
+                    # YOLO возвращает xyxy, что совпадает с нашим форматом
+                    points = box.xyxy[0].astype(int).tolist()
+                    item = {"points": points, "value": "Detected by YOLO"}
+                    
                     if not is_duplicate(item["points"], found_qrs):
                         found_qrs.append(item)
-
-        print(f"    Найдено дополнительно: {len(found_qrs)} QR-кодов (всего)")
-
-    # ==============================================================================
-    # СТРАТЕГИЯ 3: YOLO (только если Pyzbar ничего не нашел)
-    # ==============================================================================
-    if yolo_model and len(found_qrs) == 0:
-        print("--- [Стратегия 3] Pyzbar не нашел - пробуем YOLO...")
-        try:
-            # Повышенный conf для ускорения
-            results = yolo_model(input_image_np, conf=0.40, verbose=False, imgsz=640)
-            boxes = results[0].boxes.xyxy.cpu().numpy()
-
-            if len(boxes) > 0:
-                print(f"    YOLO нашел {len(boxes)} кандидатов...")
-
-                for box in boxes:
-                    x1, y1, x2, y2 = map(int, box)
-                    box_w = x2 - x1
-                    box_h = y2 - y1
-
-                    # Меньший padding для ускорения
-                    pad_x = int(box_w * 0.10)
-                    pad_y = int(box_h * 0.10)
-                    y_start = max(0, y1 - pad_y)
-                    y_end = min(orig_h, y2 + pad_y)
-                    x_start = max(0, x1 - pad_x)
-                    x_end = min(orig_w, x2 + pad_x)
-
-                    qr_crop = input_image_np[y_start:y_end, x_start:x_end]
-
-                    if qr_crop.size == 0:
-                        continue
-
-                    # Только grayscale метод для скорости
-                    decoded_objects = _run_pyzbar_fast(qr_crop, methods=["grayscale"])
-
-                    if decoded_objects:
-                        for item in decoded_objects:
-                            qr_obj = item["qr_obj"]
-                            source = item["source"]
-                            data_bytes = qr_obj.data
-                            points_crop = np.array(qr_obj.polygon, dtype=np.float32)
-
-                            if data_bytes is not None:
-                                points_original = points_crop + [x_start, y_start]
-
-                                if not is_duplicate(points_original, found_qrs):
-                                    found_qrs.append(
-                                        {
-                                            "data": data_bytes,
-                                            "points": points_original,
-                                            "source": f"yolo_confirmed_by_{source}",
-                                        }
-                                    )
-                                    print("    ✓ YOLO нашел новый QR!")
-                                    break  # Early stop после первой находки в этом crop
-
         except Exception as e:
-            print(f"    ⚠ Ошибка YOLO: {e}")
+            print(f"    ⚠ Не удалось запустить YOLO модель: {e}")
+        
+        print(f"    Найдено с помощью YOLO: {len(found_qrs)}. (Заняло: {time.time() - start_time:.2f} с)")
 
-    # ==============================================================================
-    # ФИНАЛЬНАЯ ОБРАБОТКА
-    # ==============================================================================
-    if found_qrs:
-        print(f"--- ✓ Найдено {len(found_qrs)} уникальных QR-кодов")
-        for item in found_qrs:
-            points = item["points"]
-            source = item["source"]
+    return found_qrs
 
-            x, y, w, h = cv2.boundingRect(points.astype(int))
+# Пример использования (для тестирования)
+if __name__ == '__main__':
+    # Создаем тестовое изображение с QR-кодом
+    # В реальном коде вы будете загружать его из файла: test_image = cv2.imread("path/to/image.png")
+    try:
+        import qrcode
+        print("Генерация тестового изображения 'test_qr.png'...")
+        qr_img = qrcode.make("This is a test QR code for qr_detector.py")
+        qr_img.save("test_qr.png")
+        
+        # Загружаем созданное изображение
+        test_image = cv2.imread("test_qr.png")
+        
+        if test_image is not None:
+            print("\nНачинаем детекцию на тестовом изображении...")
+            
+            # Тестируем параллельный режим
+            found_items_parallel = find_qrs(test_image, use_parallel=True)
+            print("\n--- Результат (параллельный режим) ---")
+            if found_items_parallel:
+                for i, item in enumerate(found_items_parallel):
+                    print(f"QR #{i+1}: Координаты = {item['points']}, Значение = {item.get('value', 'N/A')}")
+            else:
+                print("QR-коды не найдены.")
 
-            annotation = {
-                f"annotation_{current_annotation_index}": {
-                    "category": "qr_code",
-                    "bbox": {"x": x, "y": y, "width": w, "height": h},
-                    "area": w * h,
-                }
-            }
-            existing_page_data["annotations"].append(annotation)
+            # Тестируем последовательный режим
+            print("\n=========================================\n")
+            found_items_seq = find_qrs(test_image, use_parallel=False)
+            print("\n--- Результат (последовательный режим) ---")
+            if found_items_seq:
+                for i, item in enumerate(found_items_seq):
+                    print(f"QR #{i+1}: Координаты = {item['points']}, Значение = {item.get('value', 'N/A')}")
+            else:
+                print("QR-коды не найдены.")
 
-            # Рисуем рамку
-            pts = points.astype(np.int32).reshape((-1, 1, 2))
-            cv2.polylines(
-                image_with_boxes, [pts], isClosed=True, color=(0, 255, 0), thickness=3
-            )
-            cv2.putText(
-                image_with_boxes,
-                f"QR",
-                (x, y - 10),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.9,
-                (0, 255, 0),
-                2,
-            )
-            current_annotation_index += 1
-    else:
-        print("--- QR-коды не найдены")
-
-    elapsed = time.time() - start_time
-    print(f"--- ⏱ Время обработки: {elapsed:.2f}s")
-
-    return image_with_boxes, existing_page_data, current_annotation_index
-
-
-# Для обратной совместимости
-add_qr_code_detections_ultimate = add_qr_code_detections_turbo
+        else:
+            print("Не удалось загрузить тестовое изображение 'test_qr.png'")
+            
+    except ImportError:
+        print("Для генерации тестового изображения установите библиотеку 'qrcode': pip install qrcode")
+    except Exception as e:
+        print(f"Произошла ошибка: {e}")
