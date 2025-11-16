@@ -1,166 +1,109 @@
-# Импортируем необходимые библиотеки
-import cv2  # OpenCV для работы с изображениями
-from pyzbar.pyzbar import decode  # pyzbar для декодирования QR-кодов
-import numpy as np  # numpy для работы с массивами
+# qr_detector.py
+import cv2
+from ultralytics import YOLO
+from pyzbar.pyzbar import decode
 
-
-def detect_qr_codes_robust(image_path):
-    """
-    Улучшенная функция для надежного обнаружения QR-кодов.
-    Использует предобработку изображения (повышение контраста, бинаризация)
-    и ищет QR-коды на нескольких версиях изображения для максимальной точности.
-
-    :param image_path: Путь к файлу изображения.
-    :return: Список словарей с координатами и метками найденных QR-кодов.
-    """
-    # --- ШАГ 1: Загрузка изображения ---
-    try:
-        image = cv2.imread(image_path, cv2.IMREAD_COLOR)
-        if image is None:
-            print(f"Ошибка: не удалось загрузить изображение по пути: {image_path}")
-            return []
-    except Exception as e:
-        print(f"Произошла ошибка при чтении файла: {e}")
-        return []
-
-    img_height, img_width, _ = image.shape
+# --- ГЛАВНОЕ ИЗМЕНЕНИЕ: ЗАГРУЖАЕМ НЕЙРОСЕТЬ YOLOv8 ---
+# Указываем путь к файлу с весами, который вы скачали.
+# Модель загрузится один раз при первом вызове.
+try:
+    model = YOLO("yolo11n.pt")
+    print("--- Модель YOLOv8 для детекции QR-кодов успешно загружена. ---")
+except Exception as e:
     print(
-        f"Изображение успешно загружено. Его размеры: {img_width}x{img_height} пикселей."
+        f"--- [КРИТИЧЕСКАЯ ОШИБКА] Не удалось загрузить модель 'yolo11n.pt'. Убедитесь, что файл находится в папке проекта. Ошибка: {e} ---"
     )
+    model = None
 
-    # --- ШАГ 2: ПРЕДОБРАБОТКА ИЗОБРАЖЕНИЯ ---
-    # Преобразуем изображение в оттенки серого, так как цвет не нужен для детекции
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-    # Увеличим контраст с помощью CLAHE (Contrast Limited Adaptive Histogram Equalization)
-    # Это помогает выровнять яркость по всему изображению и сделать детали четче.
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced_gray = clahe.apply(gray)
+def add_qr_code_detections(
+    input_image_np, existing_page_data, annotation_start_index: int
+):
+    """
+    Финальная версия детектора на YOLOv8 с порогом уверенности и масштабированием.
+    """
+    print("--- (Модель 2) Поиск QR-кодов (YOLOv8 + постобработка)...")
 
-    # Применяем АДАПТИВНОЕ пороговое преобразование.
-    # Это самый важный шаг. Он превращает изображение в черно-белое, но делает это "умно",
-    # подбирая порог для каждого небольшого участка картинки отдельно.
-    # Это решает проблему с перепадами освещения и контраста.
-    binary_image = cv2.adaptiveThreshold(
-        enhanced_gray,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        25,
-        5,  # Эти параметры можно подбирать, но текущие хорошо работают
+    if model is None:
+        return input_image_np, existing_page_data, annotation_start_index
+
+    # --- НАСТРОЙКИ, КОТОРЫЕ МОЖНО МЕНЯТЬ ---
+    # 1. Порог уверенности: отсекаем все, что ниже этого значения.
+    #    Увеличивайте, чтобы убрать ложные срабатывания. Уменьшайте, если модель пропускает настоящие QR.
+    CONFIDENCE_THRESHOLD = 0.5  # Начинаем с 50%
+
+    # 2. Масштабирование: увеличиваем изображение, чтобы найти маленькие QR-коды.
+    SCALE_FACTOR = 2.0
+
+    # --- ШАГ 1: МАСШТАБИРОВАНИЕ ---
+    h, w, _ = input_image_np.shape
+    upscaled_image = cv2.resize(
+        input_image_np,
+        (int(w * SCALE_FACTOR), int(h * SCALE_FACTOR)),
+        interpolation=cv2.INTER_CUBIC,
     )
+    print(f"--- (Модель 2) Изображение увеличено в {SCALE_FACTOR} раза.")
 
-    # --- ШАГ 3: УМНАЯ ДЕТЕКЦИЯ ---
-    # Чтобы быть на 100% уверенными, мы попробуем найти QR-коды
-    # на нескольких версиях изображения: на сером и на бинаризованном.
-    print("Начинаю поиск QR-кодов на оригинальном и улучшенном изображениях...")
+    image_with_boxes = input_image_np.copy()
+    current_annotation_index = annotation_start_index
 
-    # Поиск на исходном сером изображении
-    qr_codes_gray = decode(gray)
-    # Поиск на нашем подготовленном черно-белом изображении
-    qr_codes_binary = decode(binary_image)
+    # --- ШАГ 2: ДЕТЕКЦИЯ С ПОРОГОМ УВЕРЕННОСТИ ---
+    # Передаем в модель параметр `conf`, чтобы она сама отфильтровала слабые детекции
+    results = model(upscaled_image, conf=CONFIDENCE_THRESHOLD, verbose=False)
 
-    # Объединяем все найденные результаты и убираем дубликаты.
-    # Иногда один и тот же код находится на обеих версиях.
-    all_found_codes = {}
-    for code in qr_codes_gray + qr_codes_binary:
-        # В качестве ключа используем координаты, чтобы отсеять дубликаты
-        key = code.rect
-        if key not in all_found_codes:
-            all_found_codes[key] = code
+    found_boxes = results[0].boxes.xyxy.cpu().numpy()
 
-    qr_codes = list(all_found_codes.values())
+    if len(found_boxes) > 0:
+        print(
+            f"--- (Модель 2) YOLOv8 нашла {len(found_boxes)} QR-кодов с уверенностью > {CONFIDENCE_THRESHOLD*100}%."
+        )
 
-    # --- ШАГ 4: Обработка и отрисовка результатов ---
-    detected_data = []
-    image_with_boxes = (
-        image.copy()
-    )  # Рисовать будем на оригинальном цветном изображении
+        for box in found_boxes:
+            # Координаты пришли с увеличенного изображения, масштабируем их обратно
+            scaled_box = [int(coord / SCALE_FACTOR) for coord in box]
+            x1, y1, x2, y2 = scaled_box
 
-    if qr_codes:
-        print(f"Найдено {len(qr_codes)} QR-кодов!")
-        for qr_code in qr_codes:
-            x, y, w, h = qr_code.rect
-            print(
-                f"  - Найден QR-код. Координаты рамки: x={x}, y={y}, ширина={w}, высота={h}"
-            )
+            # --- ШАГ 3: ДЕКОДИРОВАНИЕ ---
+            # Вырезаем найденный QR-код из ОРИГИНАЛЬНОГО изображения для чистоты
+            qr_crop = input_image_np[y1:y2, x1:x2]
 
-            result = {"box": [x, y, x + w, y + h], "label": "qr_code"}
-            detected_data.append(result)
+            decoded_data = ""
+            try:
+                decoded_objects = decode(qr_crop)
+                if decoded_objects:
+                    decoded_data = decoded_objects[0].data.decode("utf-8")
+                else:
+                    decoded_data = "decoding_failed"
+            except Exception:
+                decoded_data = "decoding_error"
 
-            cv2.rectangle(image_with_boxes, (x, y), (x + w, y + h), (0, 255, 0), 4)
+            # Формируем аннотацию
+            w, h = x2 - x1, y2 - y1
+            annotation = {
+                f"annotation_{current_annotation_index}": {
+                    "category": "qr_code",
+                    "bbox": {"x": x1, "y": y1, "width": w, "height": h},
+                    "area": w * h,
+                    "decoded_data": decoded_data,
+                }
+            }
+            existing_page_data["annotations"].append(annotation)
 
-            text_to_display = "QR CODE"
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            font_scale = 2.0
-            font_thickness = 10
-            text_color = (255, 255, 255)
-            background_color = (0, 255, 0)
-
-            (text_width, text_height), baseline = cv2.getTextSize(
-                text_to_display, font, font_scale, font_thickness
-            )
-            background_start_point = (x, y - text_height - baseline - 10)
-            background_end_point = (x + text_width, y)
-
-            if background_start_point[1] < 0:
-                background_start_point = (x, y + h)
-                background_end_point = (
-                    x + text_width,
-                    y + h + text_height + baseline + 10,
-                )
-                text_start_point = (x, y + h + text_height + 5)
-            else:
-                text_start_point = (x, y - baseline - 5)
-
-            cv2.rectangle(
-                image_with_boxes,
-                background_start_point,
-                background_end_point,
-                background_color,
-                cv2.FILLED,
-            )
+            # Рисуем рамку на итоговом изображении
+            cv2.rectangle(image_with_boxes, (x1, y1), (x2, y2), (0, 255, 0), 3)
             cv2.putText(
                 image_with_boxes,
-                text_to_display,
-                text_start_point,
-                font,
-                font_scale,
-                text_color,
-                font_thickness,
+                "QR",
+                (x1, y1 - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.9,
+                (0, 255, 0),
+                2,
             )
+            current_annotation_index += 1
     else:
-        print("QR-коды не найдены на изображении.")
-
-    # --- ШАГ 5: Масштабирование и отображение результата ---
-    display_max_height = 800
-    display_max_width = 1000
-    scale = min(display_max_width / img_width, display_max_height / img_height)
-    if scale < 1:
-        new_width = int(img_width * scale)
-        new_height = int(img_height * scale)
-        resized_image = cv2.resize(
-            image_with_boxes, (new_width, new_height), interpolation=cv2.INTER_AREA
+        print(
+            f"--- (Модель 2) YOLOv8 не нашла QR-кодов с уверенностью > {CONFIDENCE_THRESHOLD*100}%."
         )
-    else:
-        resized_image = image_with_boxes
 
-    cv2.imshow("QR Code Detection Result", resized_image)
-    print("\nНажмите любую клавишу на окне с изображением, чтобы закрыть его.")
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
-
-    return detected_data
-
-
-# --- Пример использования ---
-if __name__ == "__main__":
-    # Укажите путь к вашему изображению с множеством QR-кодов
-    image_file = "page_2.png"
-
-    # Вызываем нашу новую, надежную функцию
-    results = detect_qr_codes_robust(image_file)
-
-    if results:
-        print("\n--- Итоговый результат в формате списка словарей: ---")
-        print(results)
+    return image_with_boxes, existing_page_data, current_annotation_index
